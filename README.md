@@ -11,7 +11,8 @@ A compact retro vector-graphics trench-run arcade game with three playable build
 **Python (macOS or Windows):** Install Python 3.10 or newer, then:
 
 ```bash
-cd /Users/oualidburstrom/Documents/GitHub/vector_trench
+git clone https://github.com/ouaburst/vector_trench.git
+cd vector_trench
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
