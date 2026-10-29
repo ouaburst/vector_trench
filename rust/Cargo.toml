@@ -1,7 +1,7 @@
 [package]
 name = "vector_trench"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
-macroquad = "0.4.16"
+macroquad = { version = "0.4.16", features = ["audio"] }

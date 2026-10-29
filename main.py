@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
+from pathlib import Path
 
 import pygame
 
@@ -29,6 +30,11 @@ CYAN = (73, 217, 243)
 RED = (255, 88, 92)
 YELLOW = (255, 210, 99)
 WHITE = (207, 244, 230)
+
+
+def course_center(distance: float) -> float:
+    """The trench center drifts through broad and short alternating bends."""
+    return 4.0 * math.sin(distance / 85.0) + 1.7 * math.sin(distance / 33.0)
 
 
 @dataclass
@@ -69,8 +75,22 @@ class Game:
         self.small_font = pygame.font.SysFont("monospace", 15)
         self.large_font = pygame.font.SysFont("monospace", 48, bold=True)
         self.rng = random.Random()
+        self.sounds: dict[str, pygame.mixer.Sound] = {}
+        self.muted = False
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+            for name in ("laser", "hit", "damage", "warning", "victory", "defeat"):
+                self.sounds[name] = pygame.mixer.Sound(str(Path(__file__).parent / "assets" / f"{name}.wav"))
+        except (pygame.error, FileNotFoundError):
+            # Flight remains playable on machines without an audio device.
+            self.sounds.clear()
         self.running = True
         self.reset()
+
+    def play_sound(self, name: str) -> None:
+        if not self.muted and name in self.sounds:
+            self.sounds[name].play()
 
     def reset(self) -> None:
         self.player_x = 0.0
@@ -89,14 +109,28 @@ class Game:
         self.feedback_text = ""
         self.feedback_color = WHITE
         self.threat_timer = 0.0
+        self.wall_timer = 0.0
         self.reactor_spawned = False
         self.end_state: str | None = None
+
+    def course_offset(self, z: float) -> float:
+        return course_center(self.distance + z) - course_center(self.distance)
+
+    def player_world_x(self) -> float:
+        return course_center(self.distance) + self.player_x
 
     def project(self, x: float, y: float, z: float) -> tuple[int, int] | None:
         if z <= NEAR:
             return None
         scale = FOCAL / (z + 7.0)
-        return (int(WIDTH / 2 + (x - self.player_x) * scale),
+        return (int(WIDTH / 2 + (x + self.course_offset(z) - self.player_x) * scale),
+                int(HEIGHT / 2 - (y - self.player_y) * scale))
+
+    def project_world(self, x: float, y: float, z: float) -> tuple[int, int] | None:
+        if z <= NEAR:
+            return None
+        scale = FOCAL / (z + 7.0)
+        return (int(WIDTH / 2 + (x - self.player_world_x()) * scale),
                 int(HEIGHT / 2 - (y - self.player_y) * scale))
 
     def line3d(self, a: tuple[float, float, float],
@@ -110,9 +144,17 @@ class Game:
                 a, b = b, a
             t = (a[2] - (NEAR + 0.01)) / (a[2] - b[2])
             b = tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
-        pa, pb = self.project(*a), self.project(*b)
-        if pa is not None and pb is not None:
-            pygame.draw.line(self.screen, color, pa, pb, width)
+        # Long edges are sampled so they bend with the course instead of
+        # cutting straight across its turns.
+        steps = max(1, math.ceil(abs(b[2] - a[2]) / 5.0))
+        previous = self.project(*a)
+        for step in range(1, steps + 1):
+            t = step / steps
+            point = tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+            current = self.project(*point)
+            if previous is not None and current is not None:
+                pygame.draw.line(self.screen, color, previous, current, width)
+            previous = current
 
     def draw_trench(self) -> None:
         half = TRENCH_HALF_WIDTH
@@ -189,11 +231,13 @@ class Game:
             return
         self.hull = max(0, self.hull - amount)
         self.hit_flash = 0.22
+        self.play_sound("damage")
         self.feedback_text = f"{reason} -{amount}"
         self.feedback_color = RED
         self.feedback_timer = 0.65
         if self.hull == 0:
             self.end_state = "lost"
+            self.play_sound("defeat")
 
     def burst(self, actor: Actor, color: tuple[int, int, int]) -> None:
         center = self.project(actor.x, actor.y, actor.z)
@@ -214,15 +258,17 @@ class Game:
     def fire(self) -> None:
         self.fire_timer = FIRE_INTERVAL
         self.flash_timer = 0.09
+        self.play_sound("laser")
         # The center reticle is a forward ray through the player's position.
         candidates = [a for a in self.actors if 2 < a.z < 125
-                      and abs(a.x - self.player_x) < (0.48 if a.kind == "reactor" else 1.0 if a.kind == "fighter" else 0.72)
+                      and abs(a.x + self.course_offset(a.z) - self.player_x) < (0.48 if a.kind == "reactor" else 1.0 if a.kind == "fighter" else 0.72)
                       and abs(a.y - self.player_y) < (0.48 if a.kind == "reactor" else 0.8 if a.kind == "fighter" else 0.72)]
         if candidates:
             victim = min(candidates, key=lambda a: a.z)
             self.actors.remove(victim)
             value = REACTOR_BONUS if victim.kind == "reactor" else 150 if victim.kind == "fighter" else 100
             self.score += value
+            self.play_sound("hit")
             self.burst(victim, YELLOW if victim.kind == "reactor" else GREEN)
             self.feedback_text = f"HIT +{value}"
             self.feedback_color = GREEN
@@ -230,6 +276,7 @@ class Game:
             if victim.kind == "reactor":
                 self.end_state = "won"
                 self.bolts.clear()
+                self.play_sound("victory")
         else:
             self.feedback_text = "MISS"
             self.feedback_color = DIM_GREEN
@@ -242,9 +289,17 @@ class Game:
         dx = int(keys[pygame.K_d] or keys[pygame.K_RIGHT]) - int(keys[pygame.K_a] or keys[pygame.K_LEFT])
         dy = int(keys[pygame.K_w] or keys[pygame.K_UP]) - int(keys[pygame.K_s] or keys[pygame.K_DOWN])
         length = math.hypot(dx, dy) or 1.0
-        self.player_x = max(-5.8, min(5.8, self.player_x + PLAYER_SPEED * dx / length * dt))
+        old_center = course_center(self.distance)
+        self.player_x += PLAYER_SPEED * dx / length * dt
         self.player_y = max(1.0, min(7.0, self.player_y + PLAYER_SPEED * dy / length * dt))
         self.distance += FORWARD_SPEED * dt
+        self.player_x -= course_center(self.distance) - old_center
+        self.wall_timer = max(0.0, self.wall_timer - dt)
+        if abs(self.player_x) > 5.8:
+            self.player_x = max(-5.8, min(5.8, self.player_x))
+            if self.wall_timer == 0:
+                self.damage(6, "WALL SCRAPE")
+                self.wall_timer = 0.8
         self.fire_timer = max(0.0, self.fire_timer - dt)
         self.flash_timer = max(0.0, self.flash_timer - dt)
         self.hit_flash = max(0.0, self.hit_flash - dt)
@@ -282,7 +337,7 @@ class Game:
             bolt.y += (bolt.aim_y - bolt.y) * travel
             if bolt.z <= NEAR:
                 self.bolts.remove(bolt)
-                if abs(self.player_x - bolt.aim_x) < 0.85 and abs(self.player_y - bolt.aim_y) < 0.85:
+                if abs(self.player_world_x() - bolt.aim_x) < 0.85 and abs(self.player_y - bolt.aim_y) < 0.85:
                     self.damage(8, "LASER HIT")
 
         for actor in self.actors[:]:
@@ -290,30 +345,34 @@ class Game:
             if actor.kind == "fighter":
                 # Steer toward the player with bounded turn speed; firing requires alignment.
                 turn = 2.0 * dt
-                actor.x += max(-turn, min(turn, self.player_x - actor.x))
+                target_x = self.player_x - self.course_offset(actor.z)
+                actor.x += max(-turn, min(turn, target_x - actor.x))
                 actor.y += max(-turn, min(turn, self.player_y - actor.y))
                 actor.shot_timer -= dt
                 if actor.shot_timer <= 0 and 12 < actor.z < 100:
-                    if abs(actor.x - self.player_x) < 2.3 and abs(actor.y - self.player_y) < 2.0:
-                        self.bolts.append(EnemyBolt(actor.x, actor.y, actor.z,
-                                                    self.player_x, self.player_y, actor.z))
+                    if abs(actor.x + self.course_offset(actor.z) - self.player_x) < 2.3 and abs(actor.y - self.player_y) < 2.0:
+                        self.bolts.append(EnemyBolt(course_center(self.distance + actor.z) + actor.x,
+                                                    actor.y, actor.z,
+                                                    self.player_world_x(), self.player_y, actor.z))
                         self.threat_timer = 0.5
+                        self.play_sound("warning")
                     actor.shot_timer = self.rng.uniform(1.3, 2.2)
             if actor.z <= NEAR:
                 self.actors.remove(actor)
                 if actor.kind == "reactor":
                     self.end_state = "lost"
+                    self.play_sound("defeat")
                     self.feedback_text = "FINAL TARGET MISSED"
                     self.feedback_color = RED
                     self.feedback_timer = 2.0
                 elif actor.kind == "target":
                     self.damage(12, "TARGET MISSED")
-                elif abs(actor.x - self.player_x) < 1.0 and abs(actor.y - self.player_y) < 1.0:
+                elif abs(actor.x + self.course_offset(actor.z) - self.player_x) < 1.0 and abs(actor.y - self.player_y) < 1.0:
                     self.damage(18, "COLLISION")
 
     def draw_bolt(self, bolt: EnemyBolt) -> None:
-        head = self.project(bolt.x, bolt.y, bolt.z)
-        tail = self.project(bolt.x, bolt.y, bolt.z + 4)
+        head = self.project_world(bolt.x, bolt.y, bolt.z)
+        tail = self.project_world(bolt.x, bolt.y, bolt.z + 4)
         if head is not None and tail is not None:
             pygame.draw.line(self.screen, RED, head, tail, 4)
             pygame.draw.circle(self.screen, YELLOW, head, 3)
@@ -347,6 +406,10 @@ class Game:
         if self.threat_timer > 0 and self.end_state is None:
             warning = self.font.render("INCOMING LASER - DODGE", True, RED)
             self.screen.blit(warning, warning.get_rect(center=(WIDTH // 2, 75)))
+        bend = course_center(self.distance + 45) - course_center(self.distance + 15)
+        if abs(bend) > 0.8 and self.end_state is None:
+            label("COURSE RIGHT" if bend > 0 else "COURSE LEFT", WIDTH - 178, 48,
+                  YELLOW, self.small_font)
         cx, cy = WIDTH // 2, HEIGHT // 2
         reticle_color = GREEN if self.feedback_timer > 0 and self.feedback_text.startswith("HIT +") else CYAN
         pygame.draw.circle(self.screen, reticle_color, (cx, cy), 15, 1)
@@ -359,8 +422,8 @@ class Game:
         if self.flash_timer > 0:
             pygame.draw.line(self.screen, CYAN, (WIDTH // 2 - 90, HEIGHT), (cx, cy), 3)
             pygame.draw.line(self.screen, CYAN, (WIDTH // 2 + 90, HEIGHT), (cx, cy), 3)
-        label("WASD / ARROWS  MOVE    SPACE  FIRE    R  RESTART    ESC  QUIT",
-              135, HEIGHT - 29, DIM_GREEN, self.small_font)
+        label(f"WASD / ARROWS  MOVE    SPACE  FIRE    M  {'UNMUTE' if self.muted else 'MUTE'}    R  RESTART    ESC  QUIT",
+              105, HEIGHT - 29, DIM_GREEN, self.small_font)
 
         if self.end_state is not None:
             overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -401,6 +464,8 @@ class Game:
                         self.running = False
                     elif event.key == pygame.K_r:
                         self.reset()
+                    elif event.key == pygame.K_m:
+                        self.muted = not self.muted
             self.update(dt)
             self.draw()
         pygame.quit()

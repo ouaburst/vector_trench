@@ -1,6 +1,6 @@
 # Vector Trench
 
-A compact retro vector-graphics trench-run arcade game with three playable builds: Python/Pygame, Rust for Apple Silicon macOS, and Rust for 64-bit Windows. Fly through a perspective wireframe trench, line up the center reticle, destroy targets and pursuing fighters, and protect your hull. Survive the approach, then hit the reactor core to complete the mission.
+A compact retro vector-graphics trench-run arcade game with three playable builds: Python/Pygame, Rust for Apple Silicon macOS, and Rust for 64-bit Windows. Fly through a bending wireframe trench, line up the center reticle, destroy targets and pursuing fighters, and protect your hull. Survive the approach, then hit the reactor core to complete the mission.
 
 ## Play
 
@@ -26,6 +26,7 @@ On Windows, activate the environment with `.venv\Scripts\activate` and use `pyth
 | W / S or Up / Down | Fly up / down |
 | A / D or Left / Right | Fly left / right |
 | Space | Fire continuously |
+| M | Mute / unmute sound |
 | R | Restart |
 | Esc | Quit |
 
@@ -33,7 +34,9 @@ Keep a target or fighter centered in the reticle when firing. Targets score 100 
 
 A missed target costs 12 hull points. Fighters steer toward you and launch visible laser bolts at your position; move to dodge them. The HUD warns of incoming fire and shows hits, misses, and damage. The mission fails if hull reaches zero or the reactor core passes by.
 
-The game uses only generated line art and Pygame. There are no external art or audio assets.
+The trench bends left and right during the run. Steer with the bends: scraping a wall costs 6 hull points. The HUD shows the next turn. Laser, hit, damage, warning, victory, and defeat sounds are bundled in `assets/`; both versions use the same original effects. Run `python3 tools/make_sounds.py` to regenerate them.
+
+The game uses generated line art and original synthesized sounds. It requires no external art or audio downloads.
 
 ## Rust source and rebuilding
 

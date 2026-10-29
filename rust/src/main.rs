@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use macroquad::audio::{load_sound_from_bytes, play_sound_once, Sound};
 use macroquad::prelude::*;
 
 const W: f32 = 960.0;
@@ -10,6 +11,10 @@ const PLAYER_SPEED: f32 = 7.0;
 const FIRE_INTERVAL: f32 = 0.18;
 const REACTOR_DISTANCE: f32 = 560.0;
 const BOLT_SPEED: f32 = 105.0;
+
+fn course_center(distance: f32) -> f32 {
+    4.0 * (distance / 85.0).sin() + 1.7 * (distance / 33.0).sin()
+}
 
 const BG: Color = Color::new(0.008, 0.031, 0.047, 1.0);
 const GREEN: Color = Color::new(0.31, 0.93, 0.66, 1.0);
@@ -65,6 +70,64 @@ enum EndState {
     Lost,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sfx {
+    Laser,
+    Hit,
+    Damage,
+    Warning,
+    Victory,
+    Defeat,
+}
+
+struct Sounds {
+    laser: Option<Sound>,
+    hit: Option<Sound>,
+    damage: Option<Sound>,
+    warning: Option<Sound>,
+    victory: Option<Sound>,
+    defeat: Option<Sound>,
+}
+
+impl Sounds {
+    async fn load() -> Self {
+        Self {
+            laser: load_sound_from_bytes(include_bytes!("../../assets/laser.wav"))
+                .await
+                .ok(),
+            hit: load_sound_from_bytes(include_bytes!("../../assets/hit.wav"))
+                .await
+                .ok(),
+            damage: load_sound_from_bytes(include_bytes!("../../assets/damage.wav"))
+                .await
+                .ok(),
+            warning: load_sound_from_bytes(include_bytes!("../../assets/warning.wav"))
+                .await
+                .ok(),
+            victory: load_sound_from_bytes(include_bytes!("../../assets/victory.wav"))
+                .await
+                .ok(),
+            defeat: load_sound_from_bytes(include_bytes!("../../assets/defeat.wav"))
+                .await
+                .ok(),
+        }
+    }
+
+    fn play(&self, cue: Sfx) {
+        let sound = match cue {
+            Sfx::Laser => &self.laser,
+            Sfx::Hit => &self.hit,
+            Sfx::Damage => &self.damage,
+            Sfx::Warning => &self.warning,
+            Sfx::Victory => &self.victory,
+            Sfx::Defeat => &self.defeat,
+        };
+        if let Some(sound) = sound {
+            play_sound_once(sound);
+        }
+    }
+}
+
 struct Game {
     player_x: f32,
     player_y: f32,
@@ -82,9 +145,12 @@ struct Game {
     feedback: String,
     feedback_color: Color,
     threat_timer: f32,
+    wall_timer: f32,
     reactor_spawned: bool,
     end_state: Option<EndState>,
     rng: u64,
+    muted: bool,
+    audio_events: Vec<Sfx>,
 }
 
 impl Game {
@@ -106,9 +172,12 @@ impl Game {
             feedback: String::new(),
             feedback_color: WHITE,
             threat_timer: 0.0,
+            wall_timer: 0.0,
             reactor_spawned: false,
             end_state: None,
             rng: 0x6a09_e667_f3bc_c909,
+            muted: false,
+            audio_events: Vec::new(),
         }
     }
 
@@ -123,13 +192,36 @@ impl Game {
         low + (high - low) * self.random()
     }
 
+    fn course_offset(&self, z: f32) -> f32 {
+        course_center(self.distance + z) - course_center(self.distance)
+    }
+
+    fn player_world_x(&self) -> f32 {
+        course_center(self.distance) + self.player_x
+    }
+
+    fn sound(&mut self, cue: Sfx) {
+        self.audio_events.push(cue);
+    }
+
     fn project(&self, x: f32, y: f32, z: f32) -> Option<Vec2> {
         if z <= NEAR {
             return None;
         }
         let scale = 620.0 / (z + 7.0);
         Some(vec2(
-            W / 2.0 + (x - self.player_x) * scale,
+            W / 2.0 + (x + self.course_offset(z) - self.player_x) * scale,
+            H / 2.0 - (y - self.player_y) * scale,
+        ))
+    }
+
+    fn project_world(&self, x: f32, y: f32, z: f32) -> Option<Vec2> {
+        if z <= NEAR {
+            return None;
+        }
+        let scale = 620.0 / (z + 7.0);
+        Some(vec2(
+            W / 2.0 + (x - self.player_world_x()) * scale,
             H / 2.0 - (y - self.player_y) * scale,
         ))
     }
@@ -146,9 +238,11 @@ impl Game {
         }
         self.hull = (self.hull - amount).max(0);
         self.hit_flash = 0.22;
+        self.sound(Sfx::Damage);
         self.feedback(format!("{reason} -{amount}"), RED, 0.65);
         if self.hull == 0 {
             self.end_state = Some(EndState::Lost);
+            self.sound(Sfx::Defeat);
         }
     }
 
@@ -173,6 +267,7 @@ impl Game {
     fn fire(&mut self) {
         self.fire_timer = FIRE_INTERVAL;
         self.flash_timer = 0.09;
+        self.sound(Sfx::Laser);
         let victim = self
             .actors
             .iter()
@@ -185,7 +280,7 @@ impl Game {
                 };
                 a.z > 2.0
                     && a.z < 125.0
-                    && (a.x - self.player_x).abs() < rx
+                    && (a.x + self.course_offset(a.z) - self.player_x).abs() < rx
                     && (a.y - self.player_y).abs() < ry
             })
             .min_by(|(_, a), (_, b)| a.z.total_cmp(&b.z))
@@ -198,6 +293,7 @@ impl Game {
                 Kind::Reactor => 1000,
             };
             self.score += points;
+            self.sound(Sfx::Hit);
             if let Some(screen) = self.project(actor.x, actor.y, actor.z) {
                 self.bursts.push(Burst {
                     screen,
@@ -213,6 +309,7 @@ impl Game {
             if actor.kind == Kind::Reactor {
                 self.end_state = Some(EndState::Won);
                 self.bolts.clear();
+                self.sound(Sfx::Victory);
             }
         } else {
             self.feedback("MISS", DIM, 0.18);
@@ -226,9 +323,19 @@ impl Game {
         let length = (controls.x * controls.x + controls.y * controls.y)
             .sqrt()
             .max(1.0);
-        self.player_x = (self.player_x + controls.x / length * PLAYER_SPEED * dt).clamp(-5.8, 5.8);
+        let old_center = course_center(self.distance);
+        self.player_x += controls.x / length * PLAYER_SPEED * dt;
         self.player_y = (self.player_y + controls.y / length * PLAYER_SPEED * dt).clamp(1.0, 7.0);
         self.distance += SPEED * dt;
+        self.player_x -= course_center(self.distance) - old_center;
+        self.wall_timer = (self.wall_timer - dt).max(0.0);
+        if self.player_x.abs() > 5.8 {
+            self.player_x = self.player_x.clamp(-5.8, 5.8);
+            if self.wall_timer == 0.0 {
+                self.damage(6, "WALL SCRAPE");
+                self.wall_timer = 0.8;
+            }
+        }
         self.fire_timer = (self.fire_timer - dt).max(0.0);
         self.flash_timer = (self.flash_timer - dt).max(0.0);
         self.hit_flash = (self.hit_flash - dt).max(0.0);
@@ -274,7 +381,7 @@ impl Game {
             bolt.y += (bolt.aim_y - bolt.y) * travel;
             if bolt.z <= NEAR {
                 let bolt = self.bolts.remove(index);
-                if (self.player_x - bolt.aim_x).abs() < 0.85
+                if (self.player_world_x() - bolt.aim_x).abs() < 0.85
                     && (self.player_y - bolt.aim_y).abs() < 0.85
                 {
                     self.damage(8, "LASER HIT");
@@ -287,26 +394,31 @@ impl Game {
 
         for index in (0..self.actors.len()).rev() {
             let next_shot_delay = 1.3 + 0.9 * self.random();
+            let actor_z = self.actors[index].z - SPEED * dt;
+            let course_offset = self.course_offset(actor_z);
+            let actor_world_center = course_center(self.distance + actor_z);
+            let player_world_x = self.player_world_x();
             let actor = &mut self.actors[index];
             actor.z -= SPEED * dt;
             if actor.kind == Kind::Fighter {
                 let turn = 2.0 * dt;
-                actor.x += (self.player_x - actor.x).clamp(-turn, turn);
+                actor.x += (self.player_x - course_offset - actor.x).clamp(-turn, turn);
                 actor.y += (self.player_y - actor.y).clamp(-turn, turn);
                 actor.shot_timer -= dt;
                 if actor.shot_timer <= 0.0 && actor.z > 12.0 && actor.z < 100.0 {
-                    if (actor.x - self.player_x).abs() < 2.3
+                    if (actor.x + course_offset - self.player_x).abs() < 2.3
                         && (actor.y - self.player_y).abs() < 2.0
                     {
                         self.bolts.push(Bolt {
-                            x: actor.x,
+                            x: actor_world_center + actor.x,
                             y: actor.y,
                             z: actor.z,
-                            aim_x: self.player_x,
+                            aim_x: player_world_x,
                             aim_y: self.player_y,
                             start_z: actor.z,
                         });
                         self.threat_timer = 0.5;
+                        self.audio_events.push(Sfx::Warning);
                     }
                     actor.shot_timer = next_shot_delay;
                 }
@@ -316,11 +428,12 @@ impl Game {
                 match actor.kind {
                     Kind::Reactor => {
                         self.end_state = Some(EndState::Lost);
+                        self.sound(Sfx::Defeat);
                         self.feedback("FINAL TARGET MISSED", RED, 2.0);
                     }
                     Kind::Target => self.damage(12, "TARGET MISSED"),
                     Kind::Fighter
-                        if (actor.x - self.player_x).abs() < 1.0
+                        if (actor.x + course_offset - self.player_x).abs() < 1.0
                             && (actor.y - self.player_y).abs() < 1.0 =>
                     {
                         self.damage(18, "COLLISION")
@@ -349,8 +462,20 @@ impl Game {
                 a.2 + (b.2 - a.2) * t,
             );
         }
-        if let (Some(pa), Some(pb)) = (self.project(a.0, a.1, a.2), self.project(b.0, b.1, b.2)) {
-            draw_line(pa.x, pa.y, pb.x, pb.y, width, color);
+        let steps = ((b.2 - a.2).abs() / 5.0).ceil().max(1.0) as usize;
+        let mut previous = self.project(a.0, a.1, a.2);
+        for step in 1..=steps {
+            let t = step as f32 / steps as f32;
+            let point = (
+                a.0 + (b.0 - a.0) * t,
+                a.1 + (b.1 - a.1) * t,
+                a.2 + (b.2 - a.2) * t,
+            );
+            let current = self.project(point.0, point.1, point.2);
+            if let (Some(pa), Some(pb)) = (previous, current) {
+                draw_line(pa.x, pa.y, pb.x, pb.y, width, color);
+            }
+            previous = current;
         }
     }
 
@@ -465,8 +590,8 @@ impl Game {
         }
         for bolt in &self.bolts {
             if let (Some(head), Some(tail)) = (
-                self.project(bolt.x, bolt.y, bolt.z),
-                self.project(bolt.x, bolt.y, bolt.z + 4.0),
+                self.project_world(bolt.x, bolt.y, bolt.z),
+                self.project_world(bolt.x, bolt.y, bolt.z + 4.0),
             ) {
                 draw_line(head.x, head.y, tail.x, tail.y, 4.0, RED);
                 draw_circle(head.x, head.y, 3.0, YELLOW);
@@ -528,6 +653,20 @@ impl Game {
         if self.threat_timer > 0.0 && self.end_state.is_none() {
             centered_text("INCOMING LASER - DODGE", H / 2.0 - 218.0, 27.0, RED);
         }
+        let bend = course_center(self.distance + 45.0) - course_center(self.distance + 15.0);
+        if bend.abs() > 0.8 && self.end_state.is_none() {
+            draw_text(
+                if bend > 0.0 {
+                    "COURSE RIGHT"
+                } else {
+                    "COURSE LEFT"
+                },
+                W - 180.0,
+                62.0,
+                19.0,
+                YELLOW,
+            );
+        }
         let center = vec2(W / 2.0, H / 2.0);
         let color = if self.feedback_timer > 0.0 && self.feedback.starts_with("HIT +") {
             GREEN
@@ -554,7 +693,10 @@ impl Game {
             }
         }
         centered_text(
-            "WASD / ARROWS  MOVE    SPACE  FIRE    R  RESTART    ESC  QUIT",
+            &format!(
+                "WASD / ARROWS  MOVE    SPACE  FIRE    M  {}    R  RESTART    ESC  QUIT",
+                if self.muted { "UNMUTE" } else { "MUTE" }
+            ),
             H - 18.0,
             18.0,
             DIM,
@@ -595,12 +737,18 @@ fn window_conf() -> Conf {
 #[macroquad::main(window_conf)]
 async fn main() {
     let mut game = Game::new();
+    let sounds = Sounds::load().await;
     loop {
         if is_key_pressed(KeyCode::Escape) {
             break;
         }
         if is_key_pressed(KeyCode::R) {
+            let muted = game.muted;
             game = Game::new();
+            game.muted = muted;
+        }
+        if is_key_pressed(KeyCode::M) {
+            game.muted = !game.muted;
         }
         let x = (is_key_down(KeyCode::D) || is_key_down(KeyCode::Right)) as i32
             - (is_key_down(KeyCode::A) || is_key_down(KeyCode::Left)) as i32;
@@ -612,6 +760,11 @@ async fn main() {
             fire: is_key_down(KeyCode::Space),
         };
         game.tick(get_frame_time().min(0.05), controls);
+        for cue in game.audio_events.drain(..) {
+            if !game.muted {
+                sounds.play(cue);
+            }
+        }
         game.draw();
         next_frame().await;
     }
@@ -624,9 +777,10 @@ mod tests {
     #[test]
     fn target_hit_scores_and_miss_does_not() {
         let mut game = Game::new();
+        let target_x = -game.course_offset(30.0);
         game.actors.push(Actor {
             kind: Kind::Target,
-            x: 0.0,
+            x: target_x,
             y: 3.6,
             z: 30.0,
             shot_timer: 0.0,
@@ -634,6 +788,7 @@ mod tests {
         game.fire();
         assert_eq!(game.score, 100);
         assert!(game.actors.is_empty());
+        assert!(game.audio_events.contains(&Sfx::Hit));
         game.fire();
         assert_eq!(game.score, 100);
         assert_eq!(game.feedback, "MISS");
@@ -651,6 +806,7 @@ mod tests {
         game.fire();
         assert_eq!(game.end_state, None);
         game.player_y = 1.2;
+        game.player_x = game.course_offset(30.0);
         game.fire();
         assert_eq!(game.end_state, Some(EndState::Won));
         assert_eq!(game.score, 1000);
@@ -678,5 +834,17 @@ mod tests {
         game.actors[0].z = 1.1;
         game.tick(0.01, Controls::default());
         assert_eq!(game.end_state, Some(EndState::Lost));
+    }
+
+    #[test]
+    fn bends_shift_the_trench_around_a_stationary_ship() {
+        let mut game = Game::new();
+        let world_x = game.player_world_x();
+        game.spawn_timer = 999.0;
+        game.tick(0.5, Controls::default());
+        assert!((game.player_world_x() - world_x).abs() < 0.01);
+        assert!(game.player_x.abs() > 0.1);
+        assert!(course_center(100.0) > course_center(0.0));
+        assert!(course_center(300.0) < course_center(100.0));
     }
 }
