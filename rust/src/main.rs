@@ -6,14 +6,19 @@ use macroquad::prelude::*;
 const W: f32 = 960.0;
 const H: f32 = 600.0;
 const NEAR: f32 = 1.0;
-const SPEED: f32 = 27.0;
 const PLAYER_SPEED: f32 = 7.0;
 const FIRE_INTERVAL: f32 = 0.18;
 const REACTOR_DISTANCE: f32 = 560.0;
 const BOLT_SPEED: f32 = 105.0;
+const LEVEL_SPEED: [f32; 3] = [24.0, 31.0, 39.0];
+const OBSTACLE_DELAY: [(f32, f32); 3] = [(5.0, 6.2), (3.4, 4.4), (2.1, 2.9)];
 
 fn course_center(distance: f32) -> f32 {
     4.0 * (distance / 85.0).sin() + 1.7 * (distance / 33.0).sin()
+}
+
+fn course_height(distance: f32) -> f32 {
+    2.6 * (distance / 92.0).sin() + 1.1 * (distance / 34.0).sin()
 }
 
 const BG: Color = Color::new(0.008, 0.031, 0.047, 1.0);
@@ -29,6 +34,7 @@ enum Kind {
     Target,
     Fighter,
     Reactor,
+    Obstacle,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,6 +135,8 @@ impl Sounds {
 }
 
 struct Game {
+    level: usize,
+    speed: f32,
     player_x: f32,
     player_y: f32,
     distance: f32,
@@ -138,6 +146,7 @@ struct Game {
     bolts: Vec<Bolt>,
     bursts: Vec<Burst>,
     spawn_timer: f32,
+    obstacle_timer: f32,
     fire_timer: f32,
     flash_timer: f32,
     hit_flash: f32,
@@ -154,8 +163,11 @@ struct Game {
 }
 
 impl Game {
-    fn new() -> Self {
+    fn new(level: usize) -> Self {
+        let level = level.clamp(1, 3);
         Self {
+            level,
+            speed: LEVEL_SPEED[level - 1],
             player_x: 0.0,
             player_y: 3.6,
             distance: 0.0,
@@ -165,6 +177,7 @@ impl Game {
             bolts: Vec::new(),
             bursts: Vec::new(),
             spawn_timer: 0.5,
+            obstacle_timer: 2.0,
             fire_timer: 0.0,
             flash_timer: 0.0,
             hit_flash: 0.0,
@@ -196,8 +209,16 @@ impl Game {
         course_center(self.distance + z) - course_center(self.distance)
     }
 
+    fn height_offset(&self, z: f32) -> f32 {
+        course_height(self.distance + z) - course_height(self.distance)
+    }
+
     fn player_world_x(&self) -> f32 {
         course_center(self.distance) + self.player_x
+    }
+
+    fn player_world_y(&self) -> f32 {
+        course_height(self.distance) + self.player_y
     }
 
     fn sound(&mut self, cue: Sfx) {
@@ -211,7 +232,7 @@ impl Game {
         let scale = 620.0 / (z + 7.0);
         Some(vec2(
             W / 2.0 + (x + self.course_offset(z) - self.player_x) * scale,
-            H / 2.0 - (y - self.player_y) * scale,
+            H / 2.0 - (y + self.height_offset(z) - self.player_y) * scale,
         ))
     }
 
@@ -222,7 +243,7 @@ impl Game {
         let scale = 620.0 / (z + 7.0);
         Some(vec2(
             W / 2.0 + (x - self.player_world_x()) * scale,
-            H / 2.0 - (y - self.player_y) * scale,
+            H / 2.0 - (y - self.player_world_y()) * scale,
         ))
     }
 
@@ -264,6 +285,18 @@ impl Game {
         });
     }
 
+    fn spawn_obstacle(&mut self) {
+        let x = [-3.8, 0.0, 3.8][(self.random() * 3.0) as usize % 3];
+        let y = if self.random() < 0.5 { 2.1 } else { 5.9 };
+        self.actors.push(Actor {
+            kind: Kind::Obstacle,
+            x,
+            y,
+            z: 145.0,
+            shot_timer: 0.0,
+        });
+    }
+
     fn fire(&mut self) {
         self.fire_timer = FIRE_INTERVAL;
         self.flash_timer = 0.09;
@@ -277,11 +310,13 @@ impl Game {
                     Kind::Reactor => (0.48, 0.48),
                     Kind::Fighter => (1.0, 0.8),
                     Kind::Target => (0.72, 0.72),
+                    Kind::Obstacle => (0.0, 0.0),
                 };
-                a.z > 2.0
+                a.kind != Kind::Obstacle
+                    && a.z > 2.0
                     && a.z < 125.0
                     && (a.x + self.course_offset(a.z) - self.player_x).abs() < rx
-                    && (a.y - self.player_y).abs() < ry
+                    && (a.y + self.height_offset(a.z) - self.player_y).abs() < ry
             })
             .min_by(|(_, a), (_, b)| a.z.total_cmp(&b.z))
             .map(|(i, _)| i);
@@ -291,6 +326,7 @@ impl Game {
                 Kind::Target => 100,
                 Kind::Fighter => 150,
                 Kind::Reactor => 1000,
+                Kind::Obstacle => 0,
             };
             self.score += points;
             self.sound(Sfx::Hit);
@@ -324,17 +360,30 @@ impl Game {
             .sqrt()
             .max(1.0);
         let old_center = course_center(self.distance);
+        let old_height = course_height(self.distance);
         self.player_x += controls.x / length * PLAYER_SPEED * dt;
-        self.player_y = (self.player_y + controls.y / length * PLAYER_SPEED * dt).clamp(1.0, 7.0);
-        self.distance += SPEED * dt;
+        self.player_y += controls.y / length * PLAYER_SPEED * dt;
+        self.distance += self.speed * dt;
         self.player_x -= course_center(self.distance) - old_center;
+        self.player_y -= course_height(self.distance) - old_height;
         self.wall_timer = (self.wall_timer - dt).max(0.0);
-        if self.player_x.abs() > 5.8 {
+        let wall_reason = if self.player_x.abs() > 5.8 {
+            Some("WALL SCRAPE")
+        } else if self.player_y < 1.0 || self.player_y > 7.0 {
+            Some("FLOOR / CEILING")
+        } else {
+            None
+        };
+        if let Some(reason) = wall_reason {
             self.player_x = self.player_x.clamp(-5.8, 5.8);
+            self.player_y = self.player_y.clamp(1.0, 7.0);
             if self.wall_timer == 0.0 {
-                self.damage(6, "WALL SCRAPE");
+                self.damage(6, reason);
                 self.wall_timer = 0.8;
             }
+        }
+        if self.end_state.is_some() {
+            return;
         }
         self.fire_timer = (self.fire_timer - dt).max(0.0);
         self.flash_timer = (self.flash_timer - dt).max(0.0);
@@ -371,6 +420,12 @@ impl Game {
                 self.spawn();
                 self.spawn_timer += self.range(1.5, 2.4);
             }
+            self.obstacle_timer -= dt;
+            if self.obstacle_timer <= 0.0 {
+                self.spawn_obstacle();
+                let (low, high) = OBSTACLE_DELAY[self.level - 1];
+                self.obstacle_timer += self.range(low, high);
+            }
         }
 
         for index in (0..self.bolts.len()).rev() {
@@ -382,7 +437,7 @@ impl Game {
             if bolt.z <= NEAR {
                 let bolt = self.bolts.remove(index);
                 if (self.player_world_x() - bolt.aim_x).abs() < 0.85
-                    && (self.player_y - bolt.aim_y).abs() < 0.85
+                    && (self.player_world_y() - bolt.aim_y).abs() < 0.85
                 {
                     self.damage(8, "LASER HIT");
                 }
@@ -394,27 +449,30 @@ impl Game {
 
         for index in (0..self.actors.len()).rev() {
             let next_shot_delay = 1.3 + 0.9 * self.random();
-            let actor_z = self.actors[index].z - SPEED * dt;
+            let actor_z = self.actors[index].z - self.speed * dt;
             let course_offset = self.course_offset(actor_z);
+            let height_offset = self.height_offset(actor_z);
             let actor_world_center = course_center(self.distance + actor_z);
+            let actor_world_height = course_height(self.distance + actor_z);
             let player_world_x = self.player_world_x();
+            let player_world_y = self.player_world_y();
             let actor = &mut self.actors[index];
-            actor.z -= SPEED * dt;
+            actor.z -= self.speed * dt;
             if actor.kind == Kind::Fighter {
                 let turn = 2.0 * dt;
                 actor.x += (self.player_x - course_offset - actor.x).clamp(-turn, turn);
-                actor.y += (self.player_y - actor.y).clamp(-turn, turn);
+                actor.y += (self.player_y - height_offset - actor.y).clamp(-turn, turn);
                 actor.shot_timer -= dt;
                 if actor.shot_timer <= 0.0 && actor.z > 12.0 && actor.z < 100.0 {
                     if (actor.x + course_offset - self.player_x).abs() < 2.3
-                        && (actor.y - self.player_y).abs() < 2.0
+                        && (actor.y + height_offset - self.player_y).abs() < 2.0
                     {
                         self.bolts.push(Bolt {
                             x: actor_world_center + actor.x,
-                            y: actor.y,
+                            y: actor_world_height + actor.y,
                             z: actor.z,
                             aim_x: player_world_x,
-                            aim_y: self.player_y,
+                            aim_y: player_world_y,
                             start_z: actor.z,
                         });
                         self.threat_timer = 0.5;
@@ -432,9 +490,16 @@ impl Game {
                         self.feedback("FINAL TARGET MISSED", RED, 2.0);
                     }
                     Kind::Target => self.damage(12, "TARGET MISSED"),
+                    Kind::Obstacle
+                        if (actor.x + course_offset - self.player_x).abs() < 1.25
+                            && (actor.y + height_offset - self.player_y).abs() < 1.25 =>
+                    {
+                        self.damage(20, "OBSTACLE HIT")
+                    }
+                    Kind::Obstacle => {}
                     Kind::Fighter
                         if (actor.x + course_offset - self.player_x).abs() < 1.0
-                            && (actor.y - self.player_y).abs() < 1.0 =>
+                            && (actor.y + height_offset - self.player_y).abs() < 1.0 =>
                     {
                         self.damage(18, "COLLISION")
                     }
@@ -513,6 +578,29 @@ impl Game {
         };
         let scale = 620.0 / (a.z + 7.0);
         match a.kind {
+            Kind::Obstacle => {
+                for depth in [0.0, 2.0] {
+                    let corners = [
+                        (a.x - 1.0, a.y - 1.0, a.z + depth),
+                        (a.x + 1.0, a.y - 1.0, a.z + depth),
+                        (a.x + 1.0, a.y + 1.0, a.z + depth),
+                        (a.x - 1.0, a.y + 1.0, a.z + depth),
+                    ];
+                    for i in 0..4 {
+                        self.line3d(corners[i], corners[(i + 1) % 4], RED, 2.0);
+                    }
+                }
+                for sx in [-1.0, 1.0] {
+                    for sy in [-1.0, 1.0] {
+                        self.line3d(
+                            (a.x + sx, a.y + sy, a.z),
+                            (a.x + sx, a.y + sy, a.z + 2.0),
+                            YELLOW,
+                            1.0,
+                        );
+                    }
+                }
+            }
             Kind::Target => {
                 let radius = (0.9 * scale).max(3.0);
                 if radius > 300.0 {
@@ -623,6 +711,13 @@ impl Game {
     fn hud(&self) {
         draw_text(&format!("SCORE {:06}", self.score), 24.0, 39.0, 27.0, GREEN);
         draw_text(
+            &format!("LEVEL {}  SPEED {}", self.level, self.speed as i32),
+            24.0,
+            86.0,
+            19.0,
+            DIM,
+        );
+        draw_text(
             &format!("HULL {:03}%", self.hull),
             W - 174.0,
             39.0,
@@ -667,6 +762,16 @@ impl Game {
                 YELLOW,
             );
         }
+        let climb = course_height(self.distance + 45.0) - course_height(self.distance + 15.0);
+        if climb.abs() > 0.55 && self.end_state.is_none() {
+            draw_text(
+                if climb > 0.0 { "CLIMB" } else { "DESCEND" },
+                W - 180.0,
+                84.0,
+                19.0,
+                YELLOW,
+            );
+        }
         let center = vec2(W / 2.0, H / 2.0);
         let color = if self.feedback_timer > 0.0 && self.feedback.starts_with("HIT +") {
             GREEN
@@ -694,7 +799,7 @@ impl Game {
         }
         centered_text(
             &format!(
-                "WASD / ARROWS  MOVE    SPACE  FIRE    M  {}    R  RESTART    ESC  QUIT",
+                "WASD / ARROWS  MOVE   SPACE  FIRE   M  {}   R  RESTART   TAB  LEVELS   ESC  QUIT",
                 if self.muted { "UNMUTE" } else { "MUTE" }
             ),
             H - 18.0,
@@ -714,9 +819,47 @@ impl Game {
                 27.0,
                 YELLOW,
             );
-            centered_text("PRESS R TO RESTART", H / 2.0 + 63.0, 27.0, WHITE);
+            centered_text("R RESTART  |  TAB LEVELS", H / 2.0 + 63.0, 27.0, WHITE);
         }
     }
+}
+
+fn draw_menu(selected: usize) {
+    let preview = Game::new(selected);
+    clear_background(BG);
+    preview.trench();
+    draw_rectangle(0.0, 0.0, W, H, Color::new(0.0, 0.0, 0.0, 0.80));
+    centered_text("VECTOR TRENCH", 113.0, 53.0, GREEN);
+    centered_text("SELECT A LEVEL", 164.0, 27.0, WHITE);
+    let descriptions = [
+        "TRAINING  |  SPEED 24  |  FEWER OBSTACLES",
+        "ASSAULT   |  SPEED 31  |  MORE OBSTACLES",
+        "ACE RUN   |  SPEED 39  |  DENSE OBSTACLES",
+    ];
+    for (i, description) in descriptions.iter().enumerate() {
+        let level = i + 1;
+        let y = 184.0 + i as f32 * 78.0;
+        let color = if level == selected { GREEN } else { DIM };
+        draw_rectangle_lines(174.0, y, 612.0, 58.0, 2.0, color);
+        centered_text(
+            &format!("{}   {}", level, description),
+            y + 38.0,
+            25.0,
+            color,
+        );
+    }
+    centered_text(
+        "UP / DOWN  SELECT   ENTER  START   OR PRESS 1 / 2 / 3",
+        462.0,
+        19.0,
+        CYAN,
+    );
+    centered_text(
+        "STEER THROUGH LEFT / RIGHT TURNS AND CLIMBS / DESCENTS. DODGE THE RED BLOCKS.",
+        510.0,
+        18.0,
+        WHITE,
+    );
 }
 
 fn centered_text(text: &str, y: f32, size: f32, color: Color) {
@@ -736,19 +879,82 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let mut game = Game::new();
+    let mut selected_level = 1usize;
+    let mut menu = true;
+    let mut game = Game::new(selected_level);
     let sounds = Sounds::load().await;
     loop {
         if is_key_pressed(KeyCode::Escape) {
             break;
         }
-        if is_key_pressed(KeyCode::R) {
-            let muted = game.muted;
-            game = Game::new();
-            game.muted = muted;
-        }
         if is_key_pressed(KeyCode::M) {
             game.muted = !game.muted;
+        }
+        if is_key_pressed(KeyCode::Tab) {
+            menu = true;
+            let muted = game.muted;
+            game = Game::new(selected_level);
+            game.muted = muted;
+        }
+        if menu {
+            if is_key_pressed(KeyCode::Up) {
+                selected_level = if selected_level == 1 {
+                    3
+                } else {
+                    selected_level - 1
+                };
+            }
+            if is_key_pressed(KeyCode::Down) {
+                selected_level = if selected_level == 3 {
+                    1
+                } else {
+                    selected_level + 1
+                };
+            }
+            let chosen = if is_key_pressed(KeyCode::Key1) {
+                Some(1)
+            } else if is_key_pressed(KeyCode::Key2) {
+                Some(2)
+            } else if is_key_pressed(KeyCode::Key3) {
+                Some(3)
+            } else if is_key_pressed(KeyCode::Enter) {
+                Some(selected_level)
+            } else {
+                None
+            };
+            if let Some(level) = chosen {
+                selected_level = level;
+                let muted = game.muted;
+                game = Game::new(level);
+                game.muted = muted;
+                menu = false;
+            } else {
+                draw_menu(selected_level);
+                next_frame().await;
+                continue;
+            }
+        }
+        if game.end_state.is_some() {
+            let chosen = if is_key_pressed(KeyCode::Key1) {
+                Some(1)
+            } else if is_key_pressed(KeyCode::Key2) {
+                Some(2)
+            } else if is_key_pressed(KeyCode::Key3) {
+                Some(3)
+            } else {
+                None
+            };
+            if let Some(level) = chosen {
+                selected_level = level;
+                let muted = game.muted;
+                game = Game::new(level);
+                game.muted = muted;
+            }
+        }
+        if is_key_pressed(KeyCode::R) {
+            let muted = game.muted;
+            game = Game::new(selected_level);
+            game.muted = muted;
         }
         let x = (is_key_down(KeyCode::D) || is_key_down(KeyCode::Right)) as i32
             - (is_key_down(KeyCode::A) || is_key_down(KeyCode::Left)) as i32;
@@ -776,12 +982,13 @@ mod tests {
 
     #[test]
     fn target_hit_scores_and_miss_does_not() {
-        let mut game = Game::new();
+        let mut game = Game::new(1);
         let target_x = -game.course_offset(30.0);
+        let target_y = 3.6 - game.height_offset(30.0);
         game.actors.push(Actor {
             kind: Kind::Target,
             x: target_x,
-            y: 3.6,
+            y: target_y,
             z: 30.0,
             shot_timer: 0.0,
         });
@@ -796,7 +1003,7 @@ mod tests {
 
     #[test]
     fn reactor_requires_low_aim_and_ends_mission() {
-        let mut game = Game::new();
+        let mut game = Game::new(1);
         game.distance = REACTOR_DISTANCE;
         game.spawn_timer = 999.0;
         game.tick(0.01, Controls::default());
@@ -805,7 +1012,7 @@ mod tests {
         game.actors[0].z = 30.0;
         game.fire();
         assert_eq!(game.end_state, None);
-        game.player_y = 1.2;
+        game.player_y = 1.2 + game.height_offset(30.0);
         game.player_x = game.course_offset(30.0);
         game.fire();
         assert_eq!(game.end_state, Some(EndState::Won));
@@ -814,7 +1021,7 @@ mod tests {
 
     #[test]
     fn reactor_miss_and_dodgeable_bolt() {
-        let mut game = Game::new();
+        let mut game = Game::new(1);
         game.bolts.push(Bolt {
             x: 0.0,
             y: 3.6,
@@ -837,14 +1044,40 @@ mod tests {
     }
 
     #[test]
-    fn bends_shift_the_trench_around_a_stationary_ship() {
-        let mut game = Game::new();
+    fn bends_and_climbs_shift_the_trench_around_a_stationary_ship() {
+        let mut game = Game::new(1);
         let world_x = game.player_world_x();
+        let world_y = game.player_world_y();
         game.spawn_timer = 999.0;
+        game.obstacle_timer = 999.0;
         game.tick(0.5, Controls::default());
         assert!((game.player_world_x() - world_x).abs() < 0.01);
+        assert!((game.player_world_y() - world_y).abs() < 0.01);
         assert!(game.player_x.abs() > 0.1);
+        assert!(game.player_y < 3.6);
         assert!(course_center(100.0) > course_center(0.0));
         assert!(course_center(300.0) < course_center(100.0));
+        assert!(course_height(100.0) > course_height(0.0));
+        assert!(course_height(300.0) < course_height(100.0));
+    }
+
+    #[test]
+    fn levels_change_speed_and_obstacle_collision_damages_hull() {
+        assert_eq!(Game::new(1).speed, 24.0);
+        assert_eq!(Game::new(2).speed, 31.0);
+        let mut game = Game::new(3);
+        assert_eq!(game.speed, 39.0);
+        assert!(OBSTACLE_DELAY[2].1 < OBSTACLE_DELAY[0].0);
+        game.spawn_timer = 999.0;
+        game.obstacle_timer = 999.0;
+        game.actors.push(Actor {
+            kind: Kind::Obstacle,
+            x: game.player_x - game.course_offset(1.1),
+            y: game.player_y - game.height_offset(1.1),
+            z: 1.1,
+            shot_timer: 0.0,
+        });
+        game.tick(0.01, Controls::default());
+        assert_eq!(game.hull, 80);
     }
 }

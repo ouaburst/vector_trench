@@ -17,11 +17,15 @@ NEAR = 1.0
 TRENCH_HALF_WIDTH = 7.0
 TRENCH_HEIGHT = 8.0
 PLAYER_SPEED = 7.0
-FORWARD_SPEED = 27.0
 FIRE_INTERVAL = 0.18
 REACTOR_DISTANCE = 560.0
 REACTOR_BONUS = 1000
 BOLT_SPEED = 105.0
+LEVELS = {
+    1: (24.0, (5.0, 6.2)),
+    2: (31.0, (3.4, 4.4)),
+    3: (39.0, (2.1, 2.9)),
+}
 
 BLACK = (2, 8, 12)
 GREEN = (78, 236, 168)
@@ -37,9 +41,14 @@ def course_center(distance: float) -> float:
     return 4.0 * math.sin(distance / 85.0) + 1.7 * math.sin(distance / 33.0)
 
 
+def course_height(distance: float) -> float:
+    """The trench also climbs and descends as it moves forward."""
+    return 2.6 * math.sin(distance / 92.0) + 1.1 * math.sin(distance / 34.0)
+
+
 @dataclass
 class Actor:
-    kind: str  # "target", "fighter", or "reactor"
+    kind: str  # "target", "fighter", "reactor", or "obstacle"
     x: float
     y: float
     z: float
@@ -75,6 +84,10 @@ class Game:
         self.small_font = pygame.font.SysFont("monospace", 15)
         self.large_font = pygame.font.SysFont("monospace", 48, bold=True)
         self.rng = random.Random()
+        self.level = 1
+        self.selected_level = 1
+        self.forward_speed = LEVELS[1][0]
+        self.menu = True
         self.sounds: dict[str, pygame.mixer.Sound] = {}
         self.muted = False
         try:
@@ -87,6 +100,13 @@ class Game:
             self.sounds.clear()
         self.running = True
         self.reset()
+
+    def start_game(self, level: int) -> None:
+        self.level = level
+        self.selected_level = level
+        self.forward_speed = LEVELS[level][0]
+        self.reset()
+        self.menu = False
 
     def play_sound(self, name: str) -> None:
         if not self.muted and name in self.sounds:
@@ -102,6 +122,7 @@ class Game:
         self.bolts: list[EnemyBolt] = []
         self.bursts: list[Burst] = []
         self.spawn_timer = 0.5
+        self.obstacle_timer = 2.0
         self.fire_timer = 0.0
         self.flash_timer = 0.0
         self.hit_flash = 0.0
@@ -116,22 +137,28 @@ class Game:
     def course_offset(self, z: float) -> float:
         return course_center(self.distance + z) - course_center(self.distance)
 
+    def height_offset(self, z: float) -> float:
+        return course_height(self.distance + z) - course_height(self.distance)
+
     def player_world_x(self) -> float:
         return course_center(self.distance) + self.player_x
+
+    def player_world_y(self) -> float:
+        return course_height(self.distance) + self.player_y
 
     def project(self, x: float, y: float, z: float) -> tuple[int, int] | None:
         if z <= NEAR:
             return None
         scale = FOCAL / (z + 7.0)
         return (int(WIDTH / 2 + (x + self.course_offset(z) - self.player_x) * scale),
-                int(HEIGHT / 2 - (y - self.player_y) * scale))
+                int(HEIGHT / 2 - (y + self.height_offset(z) - self.player_y) * scale))
 
     def project_world(self, x: float, y: float, z: float) -> tuple[int, int] | None:
         if z <= NEAR:
             return None
         scale = FOCAL / (z + 7.0)
         return (int(WIDTH / 2 + (x - self.player_world_x()) * scale),
-                int(HEIGHT / 2 - (y - self.player_y) * scale))
+                int(HEIGHT / 2 - (y - self.player_world_y()) * scale))
 
     def line3d(self, a: tuple[float, float, float],
                b: tuple[float, float, float], color: tuple[int, int, int],
@@ -188,6 +215,19 @@ class Game:
         if center is None:
             return
         scale = FOCAL / (actor.z + 7.0)
+        if actor.kind == "obstacle":
+            for depth in (0.0, 2.0):
+                corners = [(actor.x - 1.0, actor.y - 1.0, actor.z + depth),
+                           (actor.x + 1.0, actor.y - 1.0, actor.z + depth),
+                           (actor.x + 1.0, actor.y + 1.0, actor.z + depth),
+                           (actor.x - 1.0, actor.y + 1.0, actor.z + depth)]
+                for i in range(4):
+                    self.line3d(corners[i], corners[(i + 1) % 4], RED, 2)
+            for sx in (-1.0, 1.0):
+                for sy in (-1.0, 1.0):
+                    self.line3d((actor.x + sx, actor.y + sy, actor.z),
+                                (actor.x + sx, actor.y + sy, actor.z + 2), YELLOW)
+            return
         if actor.kind in ("target", "reactor"):
             if actor.kind == "reactor":
                 radius = max(5, int(1.3 * scale))
@@ -255,14 +295,22 @@ class Game:
             shot_timer=self.rng.uniform(1.3, 2.5),
         ))
 
+    def spawn_obstacle(self) -> None:
+        self.actors.append(Actor(
+            kind="obstacle",
+            x=self.rng.choice((-3.8, 0.0, 3.8)),
+            y=self.rng.choice((2.1, 5.9)),
+            z=145.0,
+        ))
+
     def fire(self) -> None:
         self.fire_timer = FIRE_INTERVAL
         self.flash_timer = 0.09
         self.play_sound("laser")
         # The center reticle is a forward ray through the player's position.
-        candidates = [a for a in self.actors if 2 < a.z < 125
+        candidates = [a for a in self.actors if a.kind != "obstacle" and 2 < a.z < 125
                       and abs(a.x + self.course_offset(a.z) - self.player_x) < (0.48 if a.kind == "reactor" else 1.0 if a.kind == "fighter" else 0.72)
-                      and abs(a.y - self.player_y) < (0.48 if a.kind == "reactor" else 0.8 if a.kind == "fighter" else 0.72)]
+                      and abs(a.y + self.height_offset(a.z) - self.player_y) < (0.48 if a.kind == "reactor" else 0.8 if a.kind == "fighter" else 0.72)]
         if candidates:
             victim = min(candidates, key=lambda a: a.z)
             self.actors.remove(victim)
@@ -284,22 +332,28 @@ class Game:
 
     def update(self, dt: float) -> None:
         keys = pygame.key.get_pressed()
-        if self.end_state is not None:
+        if self.menu or self.end_state is not None:
             return
         dx = int(keys[pygame.K_d] or keys[pygame.K_RIGHT]) - int(keys[pygame.K_a] or keys[pygame.K_LEFT])
         dy = int(keys[pygame.K_w] or keys[pygame.K_UP]) - int(keys[pygame.K_s] or keys[pygame.K_DOWN])
         length = math.hypot(dx, dy) or 1.0
         old_center = course_center(self.distance)
+        old_height = course_height(self.distance)
         self.player_x += PLAYER_SPEED * dx / length * dt
-        self.player_y = max(1.0, min(7.0, self.player_y + PLAYER_SPEED * dy / length * dt))
-        self.distance += FORWARD_SPEED * dt
+        self.player_y += PLAYER_SPEED * dy / length * dt
+        self.distance += self.forward_speed * dt
         self.player_x -= course_center(self.distance) - old_center
+        self.player_y -= course_height(self.distance) - old_height
         self.wall_timer = max(0.0, self.wall_timer - dt)
-        if abs(self.player_x) > 5.8:
+        wall_reason = "WALL SCRAPE" if abs(self.player_x) > 5.8 else "FLOOR / CEILING" if not 1.0 <= self.player_y <= 7.0 else None
+        if wall_reason:
             self.player_x = max(-5.8, min(5.8, self.player_x))
+            self.player_y = max(1.0, min(7.0, self.player_y))
             if self.wall_timer == 0:
-                self.damage(6, "WALL SCRAPE")
+                self.damage(6, wall_reason)
                 self.wall_timer = 0.8
+        if self.end_state is not None:
+            return
         self.fire_timer = max(0.0, self.fire_timer - dt)
         self.flash_timer = max(0.0, self.flash_timer - dt)
         self.hit_flash = max(0.0, self.hit_flash - dt)
@@ -329,6 +383,10 @@ class Game:
             if self.spawn_timer <= 0:
                 self.spawn()
                 self.spawn_timer += self.rng.uniform(1.5, 2.4)
+            self.obstacle_timer -= dt
+            if self.obstacle_timer <= 0:
+                self.spawn_obstacle()
+                self.obstacle_timer += self.rng.uniform(*LEVELS[self.level][1])
 
         for bolt in self.bolts[:]:
             bolt.z -= BOLT_SPEED * dt
@@ -337,23 +395,24 @@ class Game:
             bolt.y += (bolt.aim_y - bolt.y) * travel
             if bolt.z <= NEAR:
                 self.bolts.remove(bolt)
-                if abs(self.player_world_x() - bolt.aim_x) < 0.85 and abs(self.player_y - bolt.aim_y) < 0.85:
+                if abs(self.player_world_x() - bolt.aim_x) < 0.85 and abs(self.player_world_y() - bolt.aim_y) < 0.85:
                     self.damage(8, "LASER HIT")
 
         for actor in self.actors[:]:
-            actor.z -= FORWARD_SPEED * dt
+            actor.z -= self.forward_speed * dt
             if actor.kind == "fighter":
                 # Steer toward the player with bounded turn speed; firing requires alignment.
                 turn = 2.0 * dt
                 target_x = self.player_x - self.course_offset(actor.z)
+                target_y = self.player_y - self.height_offset(actor.z)
                 actor.x += max(-turn, min(turn, target_x - actor.x))
-                actor.y += max(-turn, min(turn, self.player_y - actor.y))
+                actor.y += max(-turn, min(turn, target_y - actor.y))
                 actor.shot_timer -= dt
                 if actor.shot_timer <= 0 and 12 < actor.z < 100:
-                    if abs(actor.x + self.course_offset(actor.z) - self.player_x) < 2.3 and abs(actor.y - self.player_y) < 2.0:
+                    if abs(actor.x + self.course_offset(actor.z) - self.player_x) < 2.3 and abs(actor.y + self.height_offset(actor.z) - self.player_y) < 2.0:
                         self.bolts.append(EnemyBolt(course_center(self.distance + actor.z) + actor.x,
-                                                    actor.y, actor.z,
-                                                    self.player_world_x(), self.player_y, actor.z))
+                                                    course_height(self.distance + actor.z) + actor.y, actor.z,
+                                                    self.player_world_x(), self.player_world_y(), actor.z))
                         self.threat_timer = 0.5
                         self.play_sound("warning")
                     actor.shot_timer = self.rng.uniform(1.3, 2.2)
@@ -367,7 +426,11 @@ class Game:
                     self.feedback_timer = 2.0
                 elif actor.kind == "target":
                     self.damage(12, "TARGET MISSED")
-                elif abs(actor.x + self.course_offset(actor.z) - self.player_x) < 1.0 and abs(actor.y - self.player_y) < 1.0:
+                elif actor.kind == "obstacle":
+                    if (abs(actor.x + self.course_offset(actor.z) - self.player_x) < 1.25
+                            and abs(actor.y + self.height_offset(actor.z) - self.player_y) < 1.25):
+                        self.damage(20, "OBSTACLE HIT")
+                elif abs(actor.x + self.course_offset(actor.z) - self.player_x) < 1.0 and abs(actor.y + self.height_offset(actor.z) - self.player_y) < 1.0:
                     self.damage(18, "COLLISION")
 
     def draw_bolt(self, bolt: EnemyBolt) -> None:
@@ -395,6 +458,7 @@ class Game:
             self.screen.blit((font or self.font).render(text, True, color), (x, y))
 
         label(f"SCORE {self.score:06d}", 24, 18, GREEN)
+        label(f"LEVEL {self.level}  SPEED {int(self.forward_speed)}", 24, 72, DIM_GREEN, self.small_font)
         label(f"HULL {self.hull:03d}%", WIDTH - 166, 18,
               RED if self.hull <= 30 else GREEN)
         if not self.reactor_spawned:
@@ -410,6 +474,10 @@ class Game:
         if abs(bend) > 0.8 and self.end_state is None:
             label("COURSE RIGHT" if bend > 0 else "COURSE LEFT", WIDTH - 178, 48,
                   YELLOW, self.small_font)
+        climb = course_height(self.distance + 45) - course_height(self.distance + 15)
+        if abs(climb) > 0.55 and self.end_state is None:
+            label("CLIMB" if climb > 0 else "DESCEND", WIDTH - 178, 68,
+                  YELLOW, self.small_font)
         cx, cy = WIDTH // 2, HEIGHT // 2
         reticle_color = GREEN if self.feedback_timer > 0 and self.feedback_text.startswith("HIT +") else CYAN
         pygame.draw.circle(self.screen, reticle_color, (cx, cy), 15, 1)
@@ -422,8 +490,8 @@ class Game:
         if self.flash_timer > 0:
             pygame.draw.line(self.screen, CYAN, (WIDTH // 2 - 90, HEIGHT), (cx, cy), 3)
             pygame.draw.line(self.screen, CYAN, (WIDTH // 2 + 90, HEIGHT), (cx, cy), 3)
-        label(f"WASD / ARROWS  MOVE    SPACE  FIRE    M  {'UNMUTE' if self.muted else 'MUTE'}    R  RESTART    ESC  QUIT",
-              105, HEIGHT - 29, DIM_GREEN, self.small_font)
+        label(f"WASD / ARROWS  MOVE   SPACE  FIRE   M  {'UNMUTE' if self.muted else 'MUTE'}   R  RESTART   TAB  LEVELS   ESC  QUIT",
+              65, HEIGHT - 29, DIM_GREEN, self.small_font)
 
         if self.end_state is not None:
             overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -435,10 +503,38 @@ class Game:
             self.screen.blit(title, title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 28)))
             result = self.font.render(f"FINAL SCORE {self.score:06d}", True, YELLOW)
             self.screen.blit(result, result.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 18)))
-            prompt = self.font.render("PRESS R TO RESTART", True, WHITE)
+            prompt = self.font.render("R RESTART  |  TAB LEVELS", True, WHITE)
             self.screen.blit(prompt, prompt.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 60)))
 
+    def draw_menu(self) -> None:
+        self.screen.fill(BLACK)
+        self.draw_trench()
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 205))
+        self.screen.blit(overlay, (0, 0))
+        title = self.large_font.render("VECTOR TRENCH", True, GREEN)
+        self.screen.blit(title, title.get_rect(center=(WIDTH // 2, 100)))
+        subtitle = self.font.render("SELECT A LEVEL", True, WHITE)
+        self.screen.blit(subtitle, subtitle.get_rect(center=(WIDTH // 2, 151)))
+        descriptions = ("TRAINING  |  SPEED 24  |  FEWER OBSTACLES",
+                        "ASSAULT   |  SPEED 31  |  MORE OBSTACLES",
+                        "ACE RUN   |  SPEED 39  |  DENSE OBSTACLES")
+        for level, description in enumerate(descriptions, 1):
+            rect = pygame.Rect(174, 184 + (level - 1) * 78, 612, 58)
+            color = GREEN if level == self.selected_level else DIM_GREEN
+            pygame.draw.rect(self.screen, color, rect, 2)
+            label = self.font.render(f"{level}   {description}", True, color)
+            self.screen.blit(label, label.get_rect(center=rect.center))
+        hint = self.small_font.render("UP / DOWN  SELECT   ENTER  START   OR PRESS 1 / 2 / 3", True, CYAN)
+        self.screen.blit(hint, hint.get_rect(center=(WIDTH // 2, 462)))
+        controls = self.small_font.render("STEER THROUGH LEFT / RIGHT TURNS AND CLIMBS / DESCENTS. DODGE THE RED BLOCKS.", True, WHITE)
+        self.screen.blit(controls, controls.get_rect(center=(WIDTH // 2, 510)))
+
     def draw(self) -> None:
+        if self.menu:
+            self.draw_menu()
+            pygame.display.flip()
+            return
         self.screen.fill(BLACK)
         self.draw_trench()
         for actor in sorted(self.actors, key=lambda a: a.z, reverse=True):
@@ -462,10 +558,24 @@ class Game:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         self.running = False
-                    elif event.key == pygame.K_r:
-                        self.reset()
                     elif event.key == pygame.K_m:
                         self.muted = not self.muted
+                    elif event.key == pygame.K_TAB:
+                        self.menu = True
+                        self.reset()
+                    elif self.menu:
+                        if event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
+                            self.start_game(event.key - pygame.K_0)
+                        elif event.key == pygame.K_UP:
+                            self.selected_level = 3 if self.selected_level == 1 else self.selected_level - 1
+                        elif event.key == pygame.K_DOWN:
+                            self.selected_level = 1 if self.selected_level == 3 else self.selected_level + 1
+                        elif event.key == pygame.K_RETURN:
+                            self.start_game(self.selected_level)
+                    elif self.end_state is not None and event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
+                        self.start_game(event.key - pygame.K_0)
+                    elif event.key == pygame.K_r:
+                        self.start_game(self.level)
             self.update(dt)
             self.draw()
         pygame.quit()
